@@ -1,39 +1,28 @@
-param([switch]$NoVersionWarn, [switch]$ForcePoshGitPrompt)
+param([bool]$ForcePoshGitPrompt, [bool]$UseLegacyTabExpansion, [bool]$EnableProxyFunctionExpansion)
 
-& $PSScriptRoot\CheckRequirements.ps1 > $null
+if (Test-Path Env:\POSHGIT_ENABLE_STRICTMODE) {
+    # Set strict mode to latest to help catch scripting errors in the module. This is done by the Pester tests.
+    Set-StrictMode -Version Latest
+}
+
+. $PSScriptRoot\CheckRequirements.ps1 > $null
 
 . $PSScriptRoot\ConsoleMode.ps1
 . $PSScriptRoot\Utils.ps1
 . $PSScriptRoot\AnsiUtils.ps1
+. $PSScriptRoot\WindowTitle.ps1
 . $PSScriptRoot\PoshGitTypes.ps1
 . $PSScriptRoot\GitUtils.ps1
 . $PSScriptRoot\GitPrompt.ps1
 . $PSScriptRoot\GitParamTabExpansion.ps1
 . $PSScriptRoot\GitTabExpansion.ps1
 . $PSScriptRoot\TortoiseGit.ps1
-. $PSScriptRoot\SshUtils.ps1
-
-if (!$Env:HOME) { $Env:HOME = "$Env:HOMEDRIVE$Env:HOMEPATH" }
-if (!$Env:HOME) { $Env:HOME = "$Env:USERPROFILE" }
 
 $IsAdmin = Test-Administrator
 
-# Probe $Host.UI.RawUI.WindowTitle to see if it can be set without errors
-$WindowTitleSupported = $false
-try {
-    $global:PreviousWindowTitle = $Host.UI.RawUI.WindowTitle
-    $newTitle = "${global:PreviousWindowTitle} "
-    $Host.UI.RawUI.WindowTitle = $newTitle
-    $WindowTitleSupported = ($Host.UI.RawUI.WindowTitle -eq $newTitle)
-    $Host.UI.RawUI.WindowTitle = $global:PreviousWindowTitle
-}
-catch {
-    Write-Debug "Probing for WindowTitleSupported errored: $_"
-}
-
 # Get the default prompt definition.
-$initialSessionState = [Runspace]::DefaultRunspace.InitialSessionState
-if (!$initialSessionState.Commands -or !$initialSessionState.Commands['prompt']) {
+$initialSessionState = [System.Management.Automation.Runspaces.Runspace]::DefaultRunspace.InitialSessionState
+if (!$initialSessionState -or !$initialSessionState.PSObject.Properties.Match('Commands') -or !$initialSessionState.Commands['prompt']) {
     $defaultPromptDef = "`$(if (test-path variable:/PSDebugContext) { '[DBG]: ' } else { '' }) + 'PS ' + `$(Get-Location) + `$(if (`$nestedpromptlevel -ge 1) { '>>' }) + '> '"
 }
 else {
@@ -42,12 +31,20 @@ else {
 
 # The built-in posh-git prompt function in ScriptBlock form.
 $GitPromptScriptBlock = {
-    $settings = $global:GitPromptSettings
-    if (!$settings) {
-        if ($WindowTitleSupported -and $global:PreviousWindowTitle) {
-            $Host.UI.RawUI.WindowTitle = $global:PreviousWindowTitle
-        }
+    $origDollarQuestion = $global:?
+    $origLastExitCode = $global:LASTEXITCODE
 
+    if (!$global:GitPromptValues) {
+        $global:GitPromptValues = [PoshGitPromptValues]::new()
+    }
+
+    $global:GitPromptValues.DollarQuestion = $origDollarQuestion
+    $global:GitPromptValues.LastExitCode = $origLastExitCode
+    $global:GitPromptValues.IsAdmin = $IsAdmin
+
+    $settings = $global:GitPromptSettings
+
+    if (!$settings) {
         return "<`$GitPromptSettings not found> "
     }
 
@@ -55,7 +52,10 @@ $GitPromptScriptBlock = {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
     }
 
-    $origLastExitCode = $global:LASTEXITCODE
+    if ($settings.SetEnvColumns) {
+        # Set COLUMNS so git knows how wide the terminal is
+        $Env:COLUMNS = $Host.UI.RawUI.WindowSize.Width
+    }
 
     # Construct/write the prompt text
     $prompt = ''
@@ -66,13 +66,17 @@ $GitPromptScriptBlock = {
     # Get the current path - formatted correctly
     $promptPath = $settings.DefaultPromptPath.Expand()
 
-    # Write the path and Git status summary information
+    # Write the delimited path and Git status summary information
     if ($settings.DefaultPromptWriteStatusFirst) {
         $prompt += Write-VcsStatus
+        $prompt += Write-Prompt $settings.BeforePath.Expand()
         $prompt += Write-Prompt $promptPath
+        $prompt += Write-Prompt $settings.AfterPath.Expand()
     }
     else {
+        $prompt += Write-Prompt $settings.BeforePath.Expand()
         $prompt += Write-Prompt $promptPath
+        $prompt += Write-Prompt $settings.AfterPath.Expand()
         $prompt += Write-VcsStatus
     }
 
@@ -93,36 +97,8 @@ $GitPromptScriptBlock = {
         $promptSuffix.Text = $promptSuffix.Text.Substring(0, $promptSuffix.Text.Length - 1)
     }
 
-    # Update the host's WindowTitle is host supports it and user has not disabled $GitPromptSettings.WindowTitle
     # This has to be *after* the call to Write-VcsStatus, which populates $global:GitStatus
-    if ($WindowTitleSupported) {
-        $windowTitle = $settings.WindowTitle
-        if (!$windowTitle) {
-            if ($global:PreviousWindowTitle) {
-                $Host.UI.RawUI.WindowTitle = $global:PreviousWindowTitle
-            }
-        }
-        else {
-            try {
-                if ($windowTitle -is [scriptblock]) {
-                    $windowTitleText = & $windowTitle $global:GitStatus $IsAdmin
-                }
-                else {
-                    $windowTitleText = $ExecutionContext.SessionState.InvokeCommand.ExpandString("$windowTitle")
-                }
-
-                # Put $windowTitleText in a string to ensure results returned by scriptblock are flattened to a string
-                $Host.UI.RawUI.WindowTitle = "$windowTitleText"
-            }
-            catch {
-                if ($global:PreviousWindowTitle) {
-                    $Host.UI.RawUI.WindowTitle = $global:PreviousWindowTitle
-                }
-
-                Write-Debug "Error occurred during evaluation of `$GitPromptSettings.WindowTitle: $_"
-            }
-        }
-    }
+    Set-WindowTitle $global:GitStatus $IsAdmin
 
     # If prompt timing enabled, write elapsed milliseconds
     if ($settings.DefaultPromptEnableTiming) {
@@ -140,8 +116,7 @@ $GitPromptScriptBlock = {
     }
     else {
         # If using ANSI, set this global to help debug ANSI issues
-        [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssigments', '')]
-        $global:PoshGitLastPrompt = EscapeAnsiString $prompt
+        $global:GitPromptValues.LastPrompt = EscapeAnsiString $prompt
     }
 
     $global:LASTEXITCODE = $origLastExitCode
@@ -172,10 +147,7 @@ if ($ForcePoshGitPrompt -or !$currentPromptDef -or ($currentPromptDef -eq $defau
 $ExecutionContext.SessionState.Module.OnRemove = {
     $global:VcsPromptStatuses = $global:VcsPromptStatuses | Where-Object { $_ -ne $PoshGitVcsPrompt }
 
-    # Revert original WindowTitle
-    if ($WindowTitleSupported -and $global:PreviousWindowTitle) {
-        $Host.UI.RawUI.WindowTitle = $global:PreviousWindowTitle
-    }
+    Reset-WindowTitle
 
     # Check if the posh-git prompt function itself has been replaced. If so, do not restore the prompt function
     $promptDef = if ($funcInfo = Get-Command prompt -ErrorAction SilentlyContinue) { $funcInfo.Definition }
@@ -195,7 +167,10 @@ $exportModuleMemberParams = @{
         'Get-GitBranchStatusColor',
         'Get-GitDirectory',
         'Get-GitStatus',
+        'Get-PromptConnectionInfo',
         'Get-PromptPath',
+        'New-GitPromptSettings',
+        'Remove-GitBranch',
         'Update-AllBranches',
         'Write-GitStatus',
         'Write-GitBranchName',
@@ -206,11 +181,6 @@ $exportModuleMemberParams = @{
         'Write-GitWorkingDirStatusSummary',
         'Write-Prompt',
         'Write-VcsStatus',
-        'Get-SshAgent',
-        'Start-SshAgent',
-        'Stop-SshAgent',
-        'Add-SshKey',
-        'Get-SshPath',
         'TabExpansion',
         'tgit'
     )

@@ -35,16 +35,24 @@ function EscapeAnsiString([string]$AnsiString) {
     $res
 }
 
-function Test-VirtualTerminalSequece([psobject]$Object) {
-    if ($global:GitPromptSettings.AnsiConsole -and ($Object -is [string])) {
-        return $Object.Contains($AnsiEscape)
-    }
-    else {
-        return $false
+function Test-VirtualTerminalSequece([psobject[]]$Object, [switch]$Force) {
+    foreach ($obj in $Object) {
+        if (($Force -or $global:GitPromptSettings.AnsiConsole) -and ($obj -is [string])) {
+            $obj.Contains($AnsiEscape)
+        }
+        else {
+            $false
+        }
     }
 }
 
 function Get-VirtualTerminalSequence ($color, [int]$offset = 0) {
+    # Don't output ANSI escape sequences if the `$color` parameter is `$null`,
+    # they would be broken anyway
+    if ($null -eq $color) {
+        return $null;
+    }
+
     if ($color -is [byte]) {
         return "${AnsiEscape}$(38 + $offset);5;${color}m"
     }
@@ -56,7 +64,11 @@ function Get-VirtualTerminalSequence ($color, [int]$offset = 0) {
         return "${AnsiEscape}$(38 + $offset);2;${r};${g};${b}m"
     }
 
-    if ($color -is [String]) {
+    # Force 'DarkYellow' to ConsoleColor, since it is not an HTML color
+    if ($color -eq [System.ConsoleColor]::DarkYellow) {
+        $color = [System.ConsoleColor]::DarkYellow
+    }
+    elseif ($color -is [String]) {
         try {
             if ($ColorTranslatorType) {
                 $color = $ColorTranslatorType::FromHtml($color)
@@ -64,11 +76,6 @@ function Get-VirtualTerminalSequence ($color, [int]$offset = 0) {
         }
         catch {
             Write-Debug $_
-        }
-
-        # Hard to get here but DarkYellow is not an HTML color but is a ConsoleColor
-        if (($color -isnot $ColorType) -and ($null -ne ($consoleColor = $color -as [System.ConsoleColor]))) {
-            $color = $consoleColor
         }
     }
 
